@@ -1,2 +1,2 @@
 # rotor
-Antenna rotorremote control, Arduino code
+Antenna rotor remote control, Arduino code
