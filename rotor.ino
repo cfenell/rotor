@@ -1,28 +1,30 @@
 // Rotor controller for satellite tracking
 // Written for SK2GJ UHF/VHF antennas
-// SM2YHP 2021
+// Carl-Fredrik Enell SM2YHP 2022
+// fredrik@i-kiruna.se
 
-#include "Wire.h" 
-#include "LiquidCrystal_I2C.h"
-#include "FiniteStateMachine.h"
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <FiniteStateMachine.h>
+#include <SimpleKalmanFilter.h>
 
 // Pin configuration
 #define AZ_SENS A0
 #define EL_SENS A1
-#define CCW_OUT 2
-#define CW_OUT 4
-#define DOWN_OUT 7
-#define UP_OUT 8
-#define BRAKE_OUT 12
+#define BRAKE_OUT 2
+#define CCW_OUT 4
+#define CW_OUT 7
+#define DOWN_OUT 8
+#define UP_OUT 12
 
 // Angle calibrations
 #define AZOFFSET 0.0
-#define AZREADMIN 0
-#define AZREADMAX 1019
+#define AZREADMIN 0.0
+#define AZREADMAX 1019.0
 #define ELOFFSET 90.0
-#define ELREADMIN 0
-#define ELREADMAX 1021
-
+#define ELREADMIN 0.0
+#define ELREADMAX 1021.0
+#define TOL 2.0
 
 // 2x16 I2C LCD, default address 0x27
 LiquidCrystal_I2C lcd(0x27,16,2);
@@ -42,19 +44,23 @@ FSM Azimuth = FSM(STOP_AZ);
 FSM Brake = FSM(BRAKE_ON);
 FSM Elevation = FSM(STOP_EL);
 
+// Set up filter
+SimpleKalmanFilter AzFilt(1, 1, 0.01);
+SimpleKalmanFilter ElFilt(1, 1, 0.01);
+
 // Global variables
-int AzRead;  // Read azimuth AD counts
+float AzRead;  // Read azimuth AD counts
 float AzCalc; // Corrected azimuth
 float AzSet;  // Set azimuth 
-int ElRead;
+float ElRead;
 float ElCalc;
 float ElSet;
 // To keep track of motor run times
 unsigned long azRun=0;
 unsigned long elRun=0;
 // Serial in
-char inChar="*";
-char prevChar="*";
+char inChar=(char)"*";
+char prevChar=(char)"*";
 String numStr="";
 // Text output
 char lcdOut[17];
@@ -66,19 +72,19 @@ char ElCalcOut[4];
 char ElSetOut[4];
 
 // Angle calibrations
-float CtoA(float azOffset, int counts, int countsmin, int countsmax) {
+float CtoA(float counts) {
   float az;
-  az=360.0*(1.0*counts-1.0*countsmin)/(float)countsmax;
-  az-=azOffset;
+  az=360.0*(counts-AZREADMIN)/AZREADMAX;
+  az-=AZOFFSET;
   if(az<0) az+=360.0;
   if(az>360) az-=360.0;   
   return az;
 }
 
-float CtoE(float elOffset, int counts, int countsmin, int countsmax) {
+float CtoE(float counts) {
   float el;
-  el=180.0*(1.0*counts-1.0*countsmin)/(float)countsmax;
-  el-=elOffset;
+  el=180.0*(counts-ELREADMIN)/ELREADMAX;
+  el-=ELOFFSET;
   return el;
 }
 
@@ -91,9 +97,9 @@ void setup() {
   pinMode(UP_OUT, OUTPUT);
   pinMode(BRAKE_OUT, OUTPUT);
   // Init angles to current at startup
-  AzCalc=CtoA(AZOFFSET,analogRead(AZ_SENS),AZREADMIN,AZREADMAX);
+  AzCalc=CtoA(analogRead(AZ_SENS));
   AzSet=AzCalc;
-  ElCalc=CtoE(ELOFFSET,analogRead(EL_SENS),ELREADMIN,ELREADMAX);
+  ElCalc=CtoE(analogRead(EL_SENS));
   ElSet=ElCalc;
   // Prepare LCD
   lcd.init();
@@ -110,25 +116,25 @@ void setup() {
 // Main program
 void loop() {
   // ADC to angles
-  AzCalc=CtoA(AZOFFSET,AzRead,AZREADMIN,AZREADMAX);
-  ElCalc=CtoE(ELOFFSET,ElRead,ELREADMIN,ELREADMAX);
+  AzCalc=CtoA(AzRead);
+  ElCalc=CtoE(ElRead);
   // Compare set and measured angles
-  if(AzCalc-AzSet > 2.0) {
+  if(AzCalc-AzSet > TOL) {
     if(Azimuth.isInState(STOP_AZ)) Azimuth.transitionTo(CCW);
   }
-  else if(AzCalc-AzSet < -2.0) {
+  else if(AzCalc-AzSet < -TOL) {
     if(Azimuth.isInState(STOP_AZ)) Azimuth.transitionTo(CW);
   }
-  else if(abs(AzCalc-AzSet)<=2.0) {
+  else if(abs(AzCalc-AzSet)<=TOL) {
     if(Azimuth.isInState(CCW) || Azimuth.isInState(CW)) Azimuth.transitionTo(STOP_AZ);
   }
-  if(ElCalc-ElSet > 1.0) {
+  if(ElCalc-ElSet > TOL) {
     if(Elevation.isInState(STOP_EL)) Elevation.transitionTo(DOWN);
   }
-  else if(ElCalc-ElSet < -1.0) {
+  else if(ElCalc-ElSet < -TOL) {
     if(Elevation.isInState(STOP_EL)) Elevation.transitionTo(UP);
   }
-  else if (abs(ElCalc-ElSet)<=1.0) {
+  else if (abs(ElCalc-ElSet)<=TOL) {
     if(Elevation.isInState(DOWN) || Elevation.isInState(UP)) Elevation.transitionTo(STOP_EL);
   }
   // Run the state machines
@@ -174,9 +180,9 @@ ISR(TIMER2_OVF_vect)
   int val;
   // Read angle
   val=analogRead(AZ_SENS); // 0-5V divider
-  if(abs(val-AzRead)<100.0) AzRead=val; //Update unless big jump due to pot glitch
+  AzRead=AzFilt.updateEstimate((float)val); 
   val=analogRead(EL_SENS); // 0-5 V divider
-  if(abs(val-ElRead)<100.0) ElRead=val; 
+  ElRead=ElFilt.updateEstimate((float)val); 
 }
                                                                                                                                                                       
 // Parse serial input
